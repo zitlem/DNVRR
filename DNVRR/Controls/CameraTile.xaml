@@ -1,0 +1,24 @@
+<UserControl x:Class="DNVRR.Controls.CameraTile"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Background="Black">
+    <Grid>
+        <!-- Video renders here via HwndHost -->
+        <Border x:Name="VideoBorder" Background="Black" />
+
+        <!-- Camera name overlay -->
+        <Border VerticalAlignment="Top" HorizontalAlignment="Left"
+                Background="#88000000" Padding="6,2" CornerRadius="0,0,4,0">
+            <TextBlock x:Name="CameraLabel" Foreground="White" FontSize="11"
+                       FontFamily="Segoe UI" />
+        </Border>
+
+        <!-- Status overlay (shown when no video) -->
+        <TextBlock x:Name="StatusText"
+                   HorizontalAlignment="Center" VerticalAlignment="Center"
+                   Foreground="#666" FontSize="13" FontFamily="Segoe UI"
+                   Text="No Signal" />
+
+        <!-- Double-click to fullscreen -->
+    </Grid>
+</UserControl>
