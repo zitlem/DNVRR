@@ -13,6 +13,9 @@ public class CameraInfo
     public string? OnvifHost { get; set; }
     public int OnvifPort { get; set; } = 80;
 
+    // Display (not persisted in cameras table)
+    public string NvrName { get; set; } = "";
+
     // Runtime state (not persisted)
     public int SdkPlayHandle { get; set; } = -1;
     public NvrInfo? Nvr { get; set; }

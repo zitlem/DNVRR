@@ -164,6 +164,32 @@ public static class HCNetSDK
         uint dwPTZPresetCmd,  // GOTO_PRESET=39
         uint dwPresetIndex);
 
+    // --- Player Index (for GPU decode) ---
+
+    [DllImport(DllName)]
+    public static extern int NET_DVR_GetRealPlayerIndex(int lRealHandle);
+
+    // --- PlayCtrl (hardware decode) ---
+
+    private const string PlayDll = "PlayCtrl.dll";
+
+    // Decode types
+    public const int CYCBUF_MODE = 0;
+    public const int DECODE_NORMAL = 0;
+    public const int DECODE_HIKVISION_GPU = 4;  // Hikvision GPU acceleration
+
+    [DllImport(PlayDll)]
+    public static extern bool PlayM4_SetStreamOpenMode(int nPort, uint dwMode);
+
+    [DllImport(PlayDll)]
+    public static extern bool PlayM4_SetDecodeType(int nPort, uint nDecType);
+
+    [DllImport(PlayDll)]
+    public static extern bool PlayM4_OpenStream(int nPort, IntPtr pFileHeadBuf, uint dwSize, uint dwBufPoolSize);
+
+    [DllImport(PlayDll)]
+    public static extern uint PlayM4_GetLastError(int nPort);
+
     // --- SDK Path (for loading dependent DLLs) ---
 
     [DllImport("kernel32.dll", SetLastError = true)]

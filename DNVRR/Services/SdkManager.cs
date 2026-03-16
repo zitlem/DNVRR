@@ -12,6 +12,8 @@ public class SdkManager : IDisposable
 {
     private bool _initialized;
     private readonly ConcurrentDictionary<string, int> _loginSessions = new(); // "ip:port" -> userId
+    private readonly ConcurrentDictionary<string, int> _startDChans = new();   // "ip:port" -> startDChan
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _loginLocks = new(); // per-NVR login lock
     private readonly ConcurrentDictionary<int, int> _playHandles = new();     // cameraId -> playHandle
     private readonly object _initLock = new();
 
@@ -38,24 +40,39 @@ public class SdkManager : IDisposable
         if (_loginSessions.TryGetValue(key, out int existing))
             return existing;
 
-        return await Task.Run(() =>
+        // Per-NVR lock to prevent concurrent logins to the same device
+        var loginLock = _loginLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+        await loginLock.WaitAsync();
+        try
         {
-            var deviceInfo = new HCNetSDK.NET_DVR_DEVICEINFO_V30();
-            int userId = HCNetSDK.NET_DVR_Login_V30(nvr.Ip, nvr.SdkPort, nvr.Username, nvr.Password, ref deviceInfo);
-            if (userId < 0)
+            // Double-check after acquiring lock
+            if (_loginSessions.TryGetValue(key, out existing))
+                return existing;
+
+            return await Task.Run(() =>
             {
-                Debug.WriteLine($"SDK login failed for {nvr.Ip}:{nvr.SdkPort}, error={HCNetSDK.NET_DVR_GetLastError()}");
-                return -1;
-            }
+                var deviceInfo = new HCNetSDK.NET_DVR_DEVICEINFO_V30();
+                int userId = HCNetSDK.NET_DVR_Login_V30(nvr.Ip, nvr.SdkPort, nvr.Username, nvr.Password, ref deviceInfo);
+                if (userId < 0)
+                {
+                    Log.Error($"SDK login failed for {nvr.Ip}:{nvr.SdkPort}, error={HCNetSDK.NET_DVR_GetLastError()}");
+                    return -1;
+                }
 
-            // Update channel info from device
-            int ipChanNum = deviceInfo.byIPChanNum + (deviceInfo.byHighDChanNum << 8);
-            nvr.Channels = ipChanNum > 0 ? ipChanNum : deviceInfo.byChanNum;
-            Debug.WriteLine($"SDK login OK: {nvr.Ip}, userId={userId}, startDChan={deviceInfo.byStartDChan}, ipChannels={ipChanNum}");
+                int ipChanNum = deviceInfo.byIPChanNum + (deviceInfo.byHighDChanNum << 8);
+                nvr.Channels = ipChanNum > 0 ? ipChanNum : deviceInfo.byChanNum;
+                int startDChan = deviceInfo.byStartDChan;
+                Log.Info($"SDK login OK: {nvr.Ip}, userId={userId}, startDChan={startDChan}, ipChannels={ipChanNum}, analogChannels={deviceInfo.byChanNum}");
 
-            _loginSessions[key] = userId;
-            return userId;
-        });
+                _loginSessions[key] = userId;
+                _startDChans[key] = startDChan;
+                return userId;
+            });
+        }
+        finally
+        {
+            loginLock.Release();
+        }
     }
 
     /// <summary>
@@ -68,12 +85,21 @@ public class SdkManager : IDisposable
         int userId = await LoginAsync(camera.Nvr);
         if (userId < 0) return -1;
 
+        var key = $"{camera.Nvr.Ip}:{camera.Nvr.SdkPort}";
+        int startDChan = _startDChans.GetValueOrDefault(key, 33);
+
         return await Task.Run(() =>
         {
-            // Try channel directly first, then 32+channel for digital channels
-            int[] channelsToTry = camera.Channel >= 33
-                ? [camera.Channel]
-                : [camera.Channel, 32 + camera.Channel];
+            // Try multiple channel mappings:
+            // 1. startDChan + (channel - 1) — standard IP camera mapping
+            // 2. channel directly — for analog or pre-mapped channels
+            // 3. 32 + channel — legacy fallback
+            var channelsToTry = new HashSet<int>
+            {
+                startDChan + camera.Channel - 1,
+                camera.Channel,
+                32 + camera.Channel,
+            };
 
             foreach (var ch in channelsToTry)
             {
@@ -83,12 +109,82 @@ public class SdkManager : IDisposable
                 {
                     _playHandles[camera.Id] = handle;
                     camera.SdkPlayHandle = handle;
-                    Debug.WriteLine($"Preview started: camera={camera.Name}, channel={ch}, handle={handle}");
+
+                    // Try to enable GPU hardware decoding
+                    try
+                    {
+                        int playerPort = HCNetSDK.NET_DVR_GetRealPlayerIndex(handle);
+                        if (playerPort >= 0)
+                        {
+                            bool gpuOk = HCNetSDK.PlayM4_SetDecodeType(playerPort, HCNetSDK.DECODE_HIKVISION_GPU);
+                            Log.Info($"Preview started: {camera.Name}, ch={ch}, handle={handle}, GPU={gpuOk}");
+                        }
+                        else
+                        {
+                            Log.Info($"Preview started: {camera.Name}, ch={ch}, handle={handle}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warn($"Preview started: {camera.Name}, ch={ch}, handle={handle}, GPU not available: {ex.Message}");
+                    }
+
                     return handle;
                 }
-                Debug.WriteLine($"Preview failed: channel={ch}, error={HCNetSDK.NET_DVR_GetLastError()}");
+                var err = HCNetSDK.NET_DVR_GetLastError();
+                Log.Warn($"Preview failed: {camera.Name}, ch={ch}, error={err}");
             }
             return -1;
+        });
+    }
+
+    /// <summary>
+    /// Probe which channels have a live video feed (no window needed).
+    /// Returns a dictionary of channel -> connected status.
+    /// </summary>
+    public async Task<Dictionary<int, bool>> ProbeChannelsAsync(NvrInfo nvr, List<int> channels)
+    {
+        int userId = await LoginAsync(nvr);
+        if (userId < 0)
+            return channels.ToDictionary(ch => ch, _ => true); // assume connected if login fails
+
+        var key = $"{nvr.Ip}:{nvr.SdkPort}";
+        int startDChan = _startDChans.GetValueOrDefault(key, 33);
+
+        return await Task.Run(() =>
+        {
+            // Noop callback — SDK sends data but we ignore it
+            HCNetSDK.RealDataCallback noop = (h, t, p, s, u) => { };
+
+            var result = new Dictionary<int, bool>();
+            int connectedCount = 0;
+
+            foreach (var ch in channels)
+            {
+                int sdkCh = startDChan - 1 + ch;
+                var previewInfo = HCNetSDK.MakePreviewInfo(sdkCh, IntPtr.Zero, streamType: 1);
+                int handle = HCNetSDK.NET_DVR_RealPlay_V40(userId, ref previewInfo, noop, IntPtr.Zero);
+
+                if (handle >= 0)
+                {
+                    HCNetSDK.NET_DVR_StopRealPlay(handle);
+                    result[ch] = true;
+                    connectedCount++;
+                }
+                else
+                {
+                    var err = HCNetSDK.NET_DVR_GetLastError();
+                    // Only error 11 (network receive fail) means no camera
+                    // Other errors may be NVR quirks — assume connected
+                    result[ch] = err != 11;
+                    if (err == 11) Log.Warn($"Probe: {nvr.Ip} ch={ch} (sdk={sdkCh}) — no video feed");
+                }
+            }
+
+            Log.Info($"SDK probe {nvr.Ip}: {connectedCount}/{channels.Count} channels connected (startDChan={startDChan})");
+            // Keep noop alive to prevent GC during probing
+            GC.KeepAlive(noop);
+            return result;
         });
     }
 

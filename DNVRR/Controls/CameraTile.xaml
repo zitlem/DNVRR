@@ -1,24 +1,31 @@
 <UserControl x:Class="DNVRR.Controls.CameraTile"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             Background="Black">
+             Background="Black" SizeChanged="OnSizeChanged">
     <Grid>
-        <!-- Video renders here via HwndHost -->
-        <Border x:Name="VideoBorder" Background="Black" />
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
 
-        <!-- Camera name overlay -->
-        <Border VerticalAlignment="Top" HorizontalAlignment="Left"
-                Background="#88000000" Padding="6,2" CornerRadius="0,0,4,0">
-            <TextBlock x:Name="CameraLabel" Foreground="White" FontSize="11"
-                       FontFamily="Segoe UI" />
-        </Border>
+        <!-- Video renders here via HwndHost, centered with 16:9 aspect ratio -->
+        <Border x:Name="VideoBorder" Grid.Row="0" Background="Black"
+                HorizontalAlignment="Center" VerticalAlignment="Center" />
 
         <!-- Status overlay (shown when no video) -->
-        <TextBlock x:Name="StatusText"
+        <TextBlock x:Name="StatusText" Grid.Row="0"
                    HorizontalAlignment="Center" VerticalAlignment="Center"
                    Foreground="#666" FontSize="13" FontFamily="Segoe UI"
-                   Text="No Signal" />
+                   Text="" Visibility="Collapsed" />
 
-        <!-- Double-click to fullscreen -->
+        <!-- Bottom bar: status dot + camera name (below video, not overlapping) -->
+        <Border Grid.Row="1" Background="#111" Padding="6,3">
+            <StackPanel Orientation="Horizontal">
+                <Ellipse x:Name="StatusDot" Width="6" Height="6"
+                         Fill="#666" Margin="0,0,4,0" VerticalAlignment="Center" />
+                <TextBlock x:Name="CameraLabel" Foreground="#ccc" FontSize="10"
+                           FontFamily="Segoe UI" VerticalAlignment="Center" />
+            </StackPanel>
+        </Border>
     </Grid>
 </UserControl>

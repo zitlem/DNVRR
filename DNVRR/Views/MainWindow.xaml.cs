@@ -1,6 +1,9 @@
 using System.Diagnostics;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Threading;
 using DNVRR.Controls;
 using DNVRR.Models;
 using DNVRR.Services;
@@ -16,22 +19,585 @@ public partial class MainWindow : Window
     private int _gridCols = 4;
     private int _gridRows = 3;
     private uint _streamType = 1; // 0=main, 1=sub
+    private ViewInfo? _activeView;
+    private List<CameraInfo> _allCameras = new();
+    private Dictionary<int, NvrInfo> _nvrMap = new();
+    private bool _suppressViewSizeChanged;
+    private DispatcherTimer? _probeTimer;
 
-    public MainWindow(SdkManager sdk, Database db)
+    private int? _restoreViewId;
+
+    public MainWindow(SdkManager sdk, Database db, Models.SavedWindowState? restoreState = null)
     {
         _sdk = sdk;
         _db = db;
         InitializeComponent();
+
+        if (restoreState != null)
+        {
+            _restoreViewId = restoreState.ViewId;
+            if (restoreState.IsMaximized)
+            {
+                WindowState = WindowState.Maximized;
+            }
+            else
+            {
+                WindowState = WindowState.Normal;
+                Left = restoreState.X;
+                Top = restoreState.Y;
+                Width = restoreState.Width;
+                Height = restoreState.Height;
+            }
+
+            if (!restoreState.LeftSidebarOpen)
+            {
+                LeftSidebar.Visibility = Visibility.Collapsed;
+                BtnToggleLeft.Content = "\u25B6";
+            }
+            if (!restoreState.RightSidebarOpen)
+            {
+                Sidebar.Visibility = Visibility.Collapsed;
+                BtnToggleRight.Content = "\u25C0";
+            }
+        }
+
         Loaded += MainWindow_Loaded;
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
+        LoadSidebar();
+
+        // Restore active view if specified
+        if (_restoreViewId.HasValue)
+        {
+            var views = _db.GetViews();
+            var view = views.FirstOrDefault(v => v.Id == _restoreViewId.Value);
+            if (view != null)
+            {
+                _activeView = view;
+                _gridCols = view.Cols;
+                _gridRows = view.Rows;
+                UpdateViewHighlight();
+                BuildCamerasList();
+            }
+        }
+
+        // Probe camera connections before loading previews
+        if (_sdk.IsInitialized)
+            await ProbeAllCameras();
+
+        await LoadCameras();
+
+        // Re-probe every 5 minutes
+        if (_sdk.IsInitialized)
+        {
+            _probeTimer = new DispatcherTimer { Interval = TimeSpan.FromMinutes(5) };
+            _probeTimer.Tick += async (_, _) =>
+            {
+                await ProbeAllCameras();
+                BuildCamerasList();
+            };
+            _probeTimer.Start();
+        }
+    }
+
+    private async Task ProbeAllCameras()
+    {
+        if (!_sdk.IsInitialized) return;
+
+        var nvrs = _db.GetNvrs();
+        var allCameras = _db.GetCameras();
+
+        foreach (var nvr in nvrs)
+        {
+            var cameras = allCameras.Where(c => c.NvrId == nvr.Id).ToList();
+            if (cameras.Count == 0) continue;
+
+            var channels = cameras.Select(c => c.Channel).ToList();
+            var connectedMap = await _sdk.ProbeChannelsAsync(nvr, channels);
+
+            foreach (var cam in cameras)
+            {
+                bool connected = connectedMap.GetValueOrDefault(cam.Channel, true);
+                if (cam.Connected != connected)
+                {
+                    cam.Connected = connected;
+                    _db.UpdateCameraConnected(cam.Id, connected);
+                }
+            }
+        }
+
+        // Update the in-memory camera list and sidebar
+        foreach (var cam in _allCameras)
+        {
+            var fresh = allCameras.FirstOrDefault(c => c.Id == cam.Id);
+            if (fresh != null) cam.Connected = fresh.Connected;
+        }
+        BuildCamerasList();
+    }
+
+    public Models.SavedWindowState GetWindowState()
+    {
+        var isMax = WindowState == WindowState.Maximized;
+        return new Models.SavedWindowState
+        {
+            ViewId = _activeView?.Id,
+            X = isMax ? RestoreBounds.Left : Left,
+            Y = isMax ? RestoreBounds.Top : Top,
+            Width = isMax ? RestoreBounds.Width : Width,
+            Height = isMax ? RestoreBounds.Height : Height,
+            IsMaximized = isMax,
+            LeftSidebarOpen = LeftSidebar.Visibility == Visibility.Visible,
+            RightSidebarOpen = Sidebar.Visibility == Visibility.Visible,
+        };
+    }
+
+    // --- Sidebar ---
+
+    private void LoadSidebar()
+    {
+        // Load views — create a default if none exist
+        var views = _db.GetViews();
+        if (views.Count == 0)
+        {
+            // Auto-populate default view with all enabled cameras
+            var cameras = _db.GetCameras().Where(c => c.Enabled).ToList();
+            var defaultView = new ViewInfo { Name = "Default", Slug = "default", Cols = 4, Rows = 3 };
+            var grid = new int?[12];
+            for (int i = 0; i < Math.Min(cameras.Count, grid.Length); i++)
+                grid[i] = cameras[i].Id;
+            defaultView.SetGridArray(grid);
+            defaultView.Id = _db.AddView(defaultView);
+            views = [defaultView];
+        }
+
+        // Auto-select first view if none active
+        if (_activeView == null || views.All(v => v.Id != _activeView.Id))
+        {
+            _activeView = views[0];
+            _gridCols = _activeView.Cols;
+            _gridRows = _activeView.Rows;
+        }
+
+        ViewsList.ItemsSource = views;
+        UpdateViewHighlight();
+
+        // Load cameras grouped by NVR
+        var nvrs = _db.GetNvrs();
+        _nvrMap = nvrs.ToDictionary(n => n.Id);
+        _allCameras = _db.GetCameras().Where(c => c.Enabled).ToList();
+        foreach (var cam in _allCameras)
+            cam.Nvr = _nvrMap.GetValueOrDefault(cam.NvrId);
+
+        BuildCamerasList();
+    }
+
+    private void BuildCamerasList()
+    {
+        var panel = new StackPanel();
+        var grouped = _allCameras.GroupBy(c => c.NvrId);
+
+        // Get camera IDs in current view for dimming
+        var inView = new HashSet<int>();
+        if (_activeView != null)
+        {
+            foreach (var id in _activeView.GetGridArray())
+                if (id.HasValue) inView.Add(id.Value);
+        }
+
+        foreach (var group in grouped)
+        {
+            var nvrName = _nvrMap.GetValueOrDefault(group.Key)?.DisplayName ?? "Unknown NVR";
+            var cameras = group.ToList();
+
+            // NVR group header
+            var header = new Border
+            {
+                Padding = new Thickness(10, 6, 10, 6),
+                BorderThickness = new Thickness(0, 0, 0, 1),
+                BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#2a2d35")),
+                Cursor = Cursors.Hand,
+            };
+            var headerPanel = new DockPanel();
+            headerPanel.Children.Add(new TextBlock
+            {
+                Text = $"\u25BC  {nvrName}",
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#71717a")),
+                FontSize = 11,
+                FontWeight = FontWeights.SemiBold,
+            });
+            headerPanel.Children.Add(new TextBlock
+            {
+                Text = cameras.Count.ToString(),
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#71717a")),
+                FontSize = 10,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Opacity = 0.6,
+            });
+            header.Child = headerPanel;
+
+            var camsPanel = new StackPanel();
+            foreach (var cam in cameras)
+            {
+                var isInView = inView.Contains(cam.Id);
+                var item = new Border
+                {
+                    Padding = new Thickness(22, 5, 10, 5),
+                    Cursor = Cursors.Hand,
+                    Opacity = isInView ? 0.4 : 1.0,
+                    Tag = cam,
+                    Background = Brushes.Transparent,
+                };
+                item.PreviewMouseLeftButtonDown += CameraItem_Click;
+                item.PreviewMouseMove += CameraItem_MouseMove;
+                item.MouseEnter += (s, _) =>
+                {
+                    if (s is Border b) b.Background = new SolidColorBrush(Color.FromArgb(10, 255, 255, 255));
+                };
+                item.MouseLeave += (s, _) =>
+                {
+                    if (s is Border b) b.Background = Brushes.Transparent;
+                };
+
+                var itemPanel = new DockPanel();
+                // Status dot
+                var dot = new Border
+                {
+                    Width = 5,
+                    Height = 5,
+                    CornerRadius = new CornerRadius(2.5),
+                    Background = cam.Connected
+                        ? new SolidColorBrush((Color)ColorConverter.ConvertFromString("#22c55e"))
+                        : new SolidColorBrush((Color)ColorConverter.ConvertFromString("#71717a")),
+                    Margin = new Thickness(0, 0, 6, 0),
+                    VerticalAlignment = VerticalAlignment.Center,
+                };
+                DockPanel.SetDock(dot, Dock.Left);
+                itemPanel.Children.Add(dot);
+                itemPanel.Children.Add(new TextBlock
+                {
+                    Text = cam.Name,
+                    Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#e4e4e7")),
+                    FontSize = 12,
+                    TextTrimming = TextTrimming.CharacterEllipsis,
+                });
+                item.Child = itemPanel;
+                camsPanel.Children.Add(item);
+            }
+
+            // Toggle collapse on header click
+            header.MouseLeftButtonDown += (s, _) =>
+            {
+                camsPanel.Visibility = camsPanel.Visibility == Visibility.Visible
+                    ? Visibility.Collapsed
+                    : Visibility.Visible;
+            };
+
+            panel.Children.Add(header);
+            panel.Children.Add(camsPanel);
+        }
+
+        CamerasList.Items.Clear();
+        CamerasList.Items.Add(panel);
+    }
+
+    private void UpdateViewHighlight()
+    {
+        // Update cols/rows fields
+        if (_activeView != null)
+        {
+            _suppressViewSizeChanged = true;
+            TxtViewCols.Text = _activeView.Cols.ToString();
+            TxtViewRows.Text = _activeView.Rows.ToString();
+            _suppressViewSizeChanged = false;
+        }
+
+        // Re-highlight views list items
+        if (ViewsList.ItemsSource is List<ViewInfo> views)
+        {
+            // Force re-render to pick up active state
+            ViewsList.ItemsSource = null;
+            ViewsList.ItemsSource = views;
+        }
+    }
+
+    // --- View Actions ---
+
+    private async void ViewItem_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is Border border && border.DataContext is ViewInfo view)
+        {
+            _activeView = view;
+            _gridCols = view.Cols;
+            _gridRows = view.Rows;
+            UpdateViewHighlight();
+            BuildCamerasList();
+            await LoadCameras();
+            SaveStateDebounced();
+        }
+    }
+
+    private async void NewView_Click(object sender, RoutedEventArgs e)
+    {
+        // Simple input dialog using WPF
+        var dialog = new Window
+        {
+            Title = "New View",
+            Width = 300, Height = 180, SizeToContent = SizeToContent.Height,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Owner = this,
+            Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1e1e1e")),
+            ResizeMode = ResizeMode.NoResize,
+        };
+        var panel = new StackPanel { Margin = new Thickness(16) };
+        var label = new TextBlock { Text = "View name:", Foreground = Brushes.White, Margin = new Thickness(0, 0, 0, 6) };
+        var textBox = new TextBox { Text = "New View", Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#333")),
+            Foreground = Brushes.White, BorderBrush = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#555")),
+            Padding = new Thickness(4, 3, 4, 3), CaretBrush = Brushes.White };
+        textBox.SelectAll();
+        var btnPanel = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 10, 0, 0) };
+        var okBtn = new Button { Content = "Create", Padding = new Thickness(16, 4, 16, 4), IsDefault = true };
+        okBtn.Click += (_, _) => { dialog.DialogResult = true; };
+        var cancelBtn = new Button { Content = "Cancel", Padding = new Thickness(16, 4, 16, 4), Margin = new Thickness(8, 0, 0, 0) };
+        cancelBtn.Click += (_, _) => { dialog.DialogResult = false; };
+        btnPanel.Children.Add(okBtn);
+        btnPanel.Children.Add(cancelBtn);
+        panel.Children.Add(label);
+        panel.Children.Add(textBox);
+        panel.Children.Add(btnPanel);
+        dialog.Content = panel;
+        textBox.Focus();
+
+        if (dialog.ShowDialog() != true) return;
+        var name = textBox.Text;
+        if (string.IsNullOrWhiteSpace(name)) return;
+
+        var view = new ViewInfo
+        {
+            Name = name,
+            Slug = ViewInfo.Slugify(name),
+            Cols = _gridCols,
+            Rows = _gridRows,
+        };
+        // Empty grid
+        view.SetGridArray(new int?[view.Cols * view.Rows]);
+        view.Id = _db.AddView(view);
+
+        _activeView = view;
+        LoadSidebar();
         await LoadCameras();
     }
 
+    private async void ViewDelete_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button btn || btn.DataContext is not ViewInfo view) return;
+        var result = MessageBox.Show(
+            $"Delete view '{view.Name}'?",
+            "Delete View", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        if (result == MessageBoxResult.Yes)
+        {
+            _db.DeleteView(view.Id);
+            if (_activeView?.Id == view.Id)
+                _activeView = null;
+            LoadSidebar();
+            await LoadCameras();
+        }
+    }
+
+    private async void ViewSize_Changed(object sender, TextChangedEventArgs e)
+    {
+        if (_suppressViewSizeChanged || _activeView == null) return;
+
+        if (int.TryParse(TxtViewCols.Text, out int cols) && cols >= 1 && cols <= 8 &&
+            int.TryParse(TxtViewRows.Text, out int rows) && rows >= 1 && rows <= 8)
+        {
+            _activeView.Cols = cols;
+            _activeView.Rows = rows;
+            _gridCols = cols;
+            _gridRows = rows;
+
+            // Resize grid array
+            var oldGrid = _activeView.GetGridArray();
+            var newGrid = new int?[cols * rows];
+            Array.Copy(oldGrid, newGrid, Math.Min(oldGrid.Length, newGrid.Length));
+            _activeView.SetGridArray(newGrid);
+            _db.UpdateView(_activeView);
+            await LoadCameras();
+        }
+    }
+
+    // --- Camera Assignment (manual drag via mouse tracking) ---
+
+    private Point _dragStart;
+    private int? _draggingCameraId;
+    private bool _isDragging;
+
+    private void CameraItem_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (_activeView == null) return;
+        if (sender is not Border border || border.Tag is not CameraInfo cam) return;
+        _dragStart = e.GetPosition(null);
+        _pendingDragCameraId = cam.Id;
+    }
+
+    private int? _pendingDragCameraId;
+
+    private void CameraItem_MouseMove(object sender, MouseEventArgs e)
+    {
+        if (e.LeftButton != MouseButtonState.Pressed || _pendingDragCameraId == null) return;
+        if (_activeView == null) return;
+        if (_isDragging) return;
+
+        var pos = e.GetPosition(null);
+        if (Math.Abs(pos.X - _dragStart.X) < SystemParameters.MinimumHorizontalDragDistance &&
+            Math.Abs(pos.Y - _dragStart.Y) < SystemParameters.MinimumVerticalDragDistance)
+            return;
+
+        _draggingCameraId = _pendingDragCameraId;
+        _pendingDragCameraId = null;
+        _isDragging = true;
+        Mouse.OverrideCursor = Cursors.Hand;
+        Mouse.Capture(this, CaptureMode.SubTree);
+    }
+
+    private void Tile_MouseMove(object sender, MouseEventArgs e)
+    {
+        if (e.LeftButton != MouseButtonState.Pressed) return;
+        if (_activeView == null) return;
+        if (_isDragging) return;
+        if (sender is not CameraTile tile || tile.Camera == null) return;
+
+        var pos = e.GetPosition(null);
+        if (Math.Abs(pos.X - _dragStart.X) < SystemParameters.MinimumHorizontalDragDistance &&
+            Math.Abs(pos.Y - _dragStart.Y) < SystemParameters.MinimumVerticalDragDistance)
+            return;
+
+        _draggingCameraId = tile.Camera.Id;
+        _isDragging = true;
+        Mouse.OverrideCursor = Cursors.Hand;
+        Mouse.Capture(this, CaptureMode.SubTree);
+    }
+
+    private void Window_MouseMove(object sender, MouseEventArgs e)
+    {
+        if (!_isDragging) return;
+        // Cancel drag if mouse button released (safety)
+        if (e.LeftButton != MouseButtonState.Pressed)
+            CancelDrag();
+    }
+
+    private async void Window_MouseUp(object sender, MouseButtonEventArgs e)
+    {
+        if (!_isDragging)
+        {
+            _pendingDragCameraId = null;
+            return;
+        }
+
+        if (_draggingCameraId == null || _activeView == null)
+        {
+            CancelDrag();
+            return;
+        }
+
+        int camId = _draggingCameraId.Value;
+        CancelDrag();
+
+        // Check if mouse is over the grid
+        var pos = e.GetPosition(CameraGrid);
+        if (pos.X < 0 || pos.Y < 0 || pos.X > CameraGrid.ActualWidth || pos.Y > CameraGrid.ActualHeight)
+            return;
+
+        int col = Math.Clamp((int)(pos.X / (CameraGrid.ActualWidth / _gridCols)), 0, _gridCols - 1);
+        int row = Math.Clamp((int)(pos.Y / (CameraGrid.ActualHeight / _gridRows)), 0, _gridRows - 1);
+        int targetSlot = row * _gridCols + col;
+
+        var grid = _activeView.GetGridArray();
+        if (targetSlot >= grid.Length) return;
+
+        // Find source slot
+        int sourceSlot = -1;
+        for (int i = 0; i < grid.Length; i++)
+            if (grid[i] == camId) { sourceSlot = i; break; }
+
+        // Don't change if dropping on same slot
+        if (sourceSlot == targetSlot) return;
+
+        // Swap
+        int? targetCamId = grid[targetSlot];
+        if (sourceSlot >= 0)
+            grid[sourceSlot] = targetCamId;
+        grid[targetSlot] = camId;
+
+        _activeView.SetGridArray(grid);
+        _db.UpdateView(_activeView);
+        BuildCamerasList();
+
+        // Update only the affected tiles instead of rebuilding everything
+        await SwapTileCamera(targetSlot, camId);
+        if (sourceSlot >= 0)
+            await SwapTileCamera(sourceSlot, targetCamId);
+    }
+
+    private async Task SwapTileCamera(int slotIndex, int? camId)
+    {
+        if (slotIndex < 0 || slotIndex >= _tiles.Count) return;
+
+        var tile = _tiles[slotIndex];
+        await tile.StopPreview();
+
+        if (camId.HasValue)
+        {
+            var cam = _allCameras.FirstOrDefault(c => c.Id == camId.Value);
+            if (cam != null)
+            {
+                tile.Camera = cam;
+                if (_sdk.IsInitialized)
+                    _ = tile.StartPreview();
+                return;
+            }
+        }
+
+        tile.Camera = null;
+    }
+
+    private void CancelDrag()
+    {
+        _isDragging = false;
+        _draggingCameraId = null;
+        _pendingDragCameraId = null;
+        Mouse.OverrideCursor = null;
+        Mouse.Capture(null);
+    }
+
+    private async void TileRightClick(object sender, MouseButtonEventArgs e)
+    {
+        if (_activeView == null) return;
+        if (sender is not CameraTile tile || tile.Camera == null) return;
+
+        var grid = _activeView.GetGridArray();
+        int slotIndex = _tiles.IndexOf(tile);
+        for (int i = 0; i < grid.Length; i++)
+        {
+            if (grid[i] == tile.Camera.Id)
+            {
+                grid[i] = null;
+                break;
+            }
+        }
+        _activeView.SetGridArray(grid);
+        _db.UpdateView(_activeView);
+        BuildCamerasList();
+        await SwapTileCamera(slotIndex, null);
+    }
+
+    // --- Grid Loading ---
+
     public async Task LoadCameras()
     {
+        Log.Info($"LoadCameras: activeView={_activeView?.Name ?? "none"}, grid={_gridCols}x{_gridRows}");
+
         // Stop existing previews
         foreach (var tile in _tiles)
             await tile.StopPreview();
@@ -46,45 +612,94 @@ public partial class MainWindow : Window
         for (int r = 0; r < _gridRows; r++)
             CameraGrid.RowDefinitions.Add(new RowDefinition());
 
-        // Load cameras from DB
+        // Reload cameras from DB
         var nvrs = _db.GetNvrs();
-        var nvrMap = nvrs.ToDictionary(n => n.Id);
-        var cameras = _db.GetCameras().Where(c => c.Enabled).ToList();
+        _nvrMap = nvrs.ToDictionary(n => n.Id);
+        _allCameras = _db.GetCameras().Where(c => c.Enabled).ToList();
+        Log.Info($"LoadCameras: {_allCameras.Count} enabled cameras, {nvrs.Count} NVRs");
+        foreach (var cam in _allCameras)
+            cam.Nvr = _nvrMap.GetValueOrDefault(cam.NvrId);
 
-        // Attach NVR info to each camera
-        foreach (var cam in cameras)
-            cam.Nvr = nvrMap.GetValueOrDefault(cam.NvrId);
+        // Refresh sidebar cameras list
+        BuildCamerasList();
+
+        var camMap = _allCameras.ToDictionary(c => c.Id);
 
         int totalSlots = _gridCols * _gridRows;
-        for (int i = 0; i < totalSlots; i++)
+
+        if (_activeView != null)
         {
-            int row = i / _gridCols;
-            int col = i % _gridCols;
-
-            var tile = new CameraTile
+            // View mode: place cameras according to grid array
+            var gridArray = _activeView.GetGridArray();
+            Log.Info($"LoadCameras: view grid has {gridArray.Length} slots, {gridArray.Count(g => g.HasValue)} cameras assigned");
+            for (int i = 0; i < totalSlots; i++)
             {
-                SdkManager = _sdk,
-                Margin = new Thickness(1),
-            };
+                int row = i / _gridCols;
+                int col = i % _gridCols;
 
-            if (i < cameras.Count)
-                tile.Camera = cameras[i];
+                var tile = new CameraTile
+                {
+                    SdkManager = _sdk,
+                    Margin = new Thickness(1),
+                };
 
-            tile.MouseLeftButtonDown += (s, _) => SelectTile(tile);
-            tile.FullscreenRequested += Tile_FullscreenRequested;
+                if (i < gridArray.Length && gridArray[i].HasValue)
+                {
+                    if (camMap.TryGetValue(gridArray[i]!.Value, out var cam))
+                        tile.Camera = cam;
+                }
 
-            Grid.SetRow(tile, row);
-            Grid.SetColumn(tile, col);
-            CameraGrid.Children.Add(tile);
-            _tiles.Add(tile);
+                tile.PreviewMouseLeftButtonDown += (s, ev) => { SelectTile(tile); _dragStart = ev.GetPosition(null); };
+                tile.PreviewMouseMove += Tile_MouseMove;
+                tile.MouseRightButtonDown += TileRightClick;
+                tile.FullscreenRequested += Tile_FullscreenRequested;
+
+                Grid.SetRow(tile, row);
+                Grid.SetColumn(tile, col);
+                CameraGrid.Children.Add(tile);
+                _tiles.Add(tile);
+            }
+        }
+        else
+        {
+            // All Cameras mode: sequential layout
+            for (int i = 0; i < totalSlots; i++)
+            {
+                int row = i / _gridCols;
+                int col = i % _gridCols;
+
+                var tile = new CameraTile
+                {
+                    SdkManager = _sdk,
+                    Margin = new Thickness(1),
+                };
+
+                if (i < _allCameras.Count)
+                    tile.Camera = _allCameras[i];
+
+                tile.MouseLeftButtonDown += (s, _) => SelectTile(tile);
+                tile.FullscreenRequested += Tile_FullscreenRequested;
+
+                Grid.SetRow(tile, row);
+                Grid.SetColumn(tile, col);
+                CameraGrid.Children.Add(tile);
+                _tiles.Add(tile);
+            }
         }
 
-        // Start previews for all cameras
+        // Start previews and update connected status in DB
+        var cameraTiles = _tiles.Where(t => t.Camera != null).ToList();
+        Log.Info($"LoadCameras: {cameraTiles.Count} tiles with cameras, SDK initialized={_sdk.IsInitialized}");
         if (_sdk.IsInitialized)
         {
-            foreach (var tile in _tiles.Where(t => t.Camera != null))
+            foreach (var tile in cameraTiles)
             {
-                _ = tile.StartPreview(); // fire and forget — each tile connects independently
+                Log.Info($"StartPreview: {tile.Camera!.Name} (id={tile.Camera.Id})");
+                var cam = tile.Camera;
+                _ = tile.StartPreview().ContinueWith(_ =>
+                {
+                    Dispatcher.Invoke(() => _db.UpdateCameraConnected(cam.Id, cam.Connected));
+                }, TaskScheduler.Default);
             }
         }
     }
@@ -111,30 +726,25 @@ public partial class MainWindow : Window
         ["PAN_RIGHT_DOWN"] = HCNetSDK.PAN_RIGHT_DOWN,
     };
 
-    private async void Ptz_MouseDown(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    private async void Ptz_MouseDown(object sender, MouseButtonEventArgs e)
     {
         if (sender is not Button btn || _selectedTile?.Camera?.Nvr == null) return;
         var tag = btn.Tag?.ToString();
         if (tag != null && PtzCommands.TryGetValue(tag, out uint cmd))
-        {
             await _sdk.PtzMoveAsync(_selectedTile.Camera.Nvr, _selectedTile.Camera.Channel, cmd);
-        }
     }
 
-    private async void Ptz_MouseUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    private async void Ptz_MouseUp(object sender, MouseButtonEventArgs e)
     {
         if (sender is not Button btn || _selectedTile?.Camera?.Nvr == null) return;
         var tag = btn.Tag?.ToString();
         if (tag != null && PtzCommands.TryGetValue(tag, out uint cmd))
-        {
             await _sdk.PtzStopAsync(_selectedTile.Camera.Nvr, _selectedTile.Camera.Channel, cmd);
-        }
     }
 
     private async void PtzStop_Click(object sender, RoutedEventArgs e)
     {
         if (_selectedTile?.Camera?.Nvr == null) return;
-        // Stop all directions
         await _sdk.PtzStopAsync(_selectedTile.Camera.Nvr, _selectedTile.Camera.Channel, HCNetSDK.PAN_LEFT);
         await _sdk.PtzStopAsync(_selectedTile.Camera.Nvr, _selectedTile.Camera.Channel, HCNetSDK.TILT_UP);
         await _sdk.PtzStopAsync(_selectedTile.Camera.Nvr, _selectedTile.Camera.Channel, HCNetSDK.ZOOM_IN);
@@ -153,6 +763,19 @@ public partial class MainWindow : Window
             case 4: _gridCols = 4; _gridRows = 3; break;
             case 16: _gridCols = 4; _gridRows = 4; break;
         }
+
+        if (_activeView != null)
+        {
+            _activeView.Cols = _gridCols;
+            _activeView.Rows = _gridRows;
+            var oldGrid = _activeView.GetGridArray();
+            var newGrid = new int?[_gridCols * _gridRows];
+            Array.Copy(oldGrid, newGrid, Math.Min(oldGrid.Length, newGrid.Length));
+            _activeView.SetGridArray(newGrid);
+            _db.UpdateView(_activeView);
+            UpdateViewHighlight();
+        }
+
         await LoadCameras();
     }
 
@@ -162,16 +785,25 @@ public partial class MainWindow : Window
         {
             _streamType = uint.Parse(item.Tag?.ToString() ?? "1");
             if (_tiles.Count > 0)
-                await LoadCameras(); // restart with new stream type
+                await LoadCameras();
         }
     }
 
     // --- Multi-window ---
 
+    private bool _closeSingleOnly;
+
     private void NewWindow_Click(object sender, RoutedEventArgs e)
     {
         var window = new MainWindow(_sdk, _db);
         window.Show();
+    }
+
+    private void CloseWindow_Click(object sender, RoutedEventArgs e)
+    {
+        // Close just this window
+        _closeSingleOnly = true;
+        Close();
     }
 
     private void OpenAdmin_Click(object sender, RoutedEventArgs e)
@@ -184,7 +816,6 @@ public partial class MainWindow : Window
 
     private void Tile_FullscreenRequested(object? sender, EventArgs e)
     {
-        // TODO: open camera in fullscreen window on current monitor
         if (sender is CameraTile tile && tile.Camera != null)
         {
             var fsWindow = new FullscreenWindow(_sdk, tile.Camera);
@@ -192,8 +823,78 @@ public partial class MainWindow : Window
         }
     }
 
+    // --- Sidebar toggles ---
+
+    private void ToggleLeftSidebar_Click(object sender, RoutedEventArgs e)
+    {
+        if (LeftSidebar.Visibility == Visibility.Visible)
+        {
+            LeftSidebar.Visibility = Visibility.Collapsed;
+            BtnToggleLeft.Content = "\u25B6";
+        }
+        else
+        {
+            LeftSidebar.Visibility = Visibility.Visible;
+            BtnToggleLeft.Content = "\u25C0";
+        }
+        SaveStateDebounced();
+    }
+
+    private void ToggleRightSidebar_Click(object sender, RoutedEventArgs e)
+    {
+        if (Sidebar.Visibility == Visibility.Visible)
+        {
+            Sidebar.Visibility = Visibility.Collapsed;
+            BtnToggleRight.Content = "\u25C0";
+        }
+        else
+        {
+            Sidebar.Visibility = Visibility.Visible;
+            BtnToggleRight.Content = "\u25B6";
+        }
+        SaveStateDebounced();
+    }
+
+    private DispatcherTimer? _saveDebounce;
+
+    private void Window_StateChanged(object sender, EventArgs e) => SaveStateDebounced();
+
+    private void SaveStateDebounced()
+    {
+        // Debounce — save 500ms after the last change
+        if (_saveDebounce == null)
+        {
+            _saveDebounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+            _saveDebounce.Tick += (_, _) =>
+            {
+                _saveDebounce.Stop();
+                if (Application.Current is App app)
+                    app.SaveAllWindowStates();
+            };
+        }
+        _saveDebounce.Stop();
+        _saveDebounce.Start();
+    }
+
     private async void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
+        _probeTimer?.Stop();
+        _saveDebounce?.Stop();
+        // X button closes all windows; "Close Window" button closes just this one
+        if (!_closeSingleOnly)
+        {
+            var others = new List<MainWindow>();
+            foreach (Window w in Application.Current.Windows)
+                if (w is MainWindow mw && mw != this)
+                    others.Add(mw);
+
+            foreach (var mw in others)
+            {
+                mw._closeSingleOnly = true; // prevent recursive close-all
+                mw.Close();
+            }
+        }
+
         foreach (var tile in _tiles)
             await tile.StopPreview();
     }

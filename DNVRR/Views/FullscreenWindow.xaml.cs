@@ -24,6 +24,7 @@ public partial class FullscreenWindow : Window
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
         _videoPanel = new VideoPanel();
+        _videoPanel.NativeDoubleClick += (_, _) => Dispatcher.Invoke(Close);
         VideoBorder.Child = _videoPanel;
 
         // Small delay to let HWND initialize

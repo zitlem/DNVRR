@@ -6,3 +6,5 @@ obj/
 *.pdb
 sdk/
 data/
+DNVRR.exe
+.claude/

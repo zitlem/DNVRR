@@ -27,33 +27,55 @@ public class ISAPIClient : IDisposable
     {
         if (_client != null) return _client;
 
-        // Try basic auth first, fall back to digest
-        var basicHandler = new HttpClientHandler { Credentials = new NetworkCredential(_username, _password) };
-        var basicClient = new HttpClient(basicHandler) { BaseAddress = new Uri(_baseUrl), Timeout = TimeSpan.FromSeconds(10) };
+        // Match NVRR approach: try Basic auth first (sent proactively), fall back to Digest
+        // Step 1: Basic auth with proactive Authorization header
+        var basicClient = new HttpClient(new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback = (_, _, _, _) => true,
+        })
+        {
+            BaseAddress = new Uri(_baseUrl),
+            Timeout = TimeSpan.FromSeconds(10),
+        };
+        var basicAuth = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes($"{_username}:{_password}"));
+        basicClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", basicAuth);
 
         try
         {
             var resp = await basicClient.GetAsync("/ISAPI/System/deviceInfo");
+            Log.Info($"ISAPI Basic {_baseUrl}: status={resp.StatusCode}");
+
             if (resp.StatusCode != HttpStatusCode.Unauthorized)
             {
+                // Basic auth works
                 _client = basicClient;
                 return _client;
             }
         }
-        catch { }
+        catch (HttpRequestException ex)
+        {
+            Log.Warn($"ISAPI {_baseUrl} connection failed: {ex.Message}");
+            basicClient.Dispose();
+            throw;
+        }
 
+        // Step 2: Basic got 401, switch to Digest (like NVRR's httpx.DigestAuth)
         basicClient.Dispose();
-        basicHandler.Dispose();
+        Log.Info($"ISAPI switching to Digest auth for {_baseUrl}");
 
-        // Digest auth
         var digestHandler = new HttpClientHandler
         {
             Credentials = new CredentialCache
             {
                 { new Uri(_baseUrl), "Digest", new NetworkCredential(_username, _password) }
-            }
+            },
+            ServerCertificateCustomValidationCallback = (_, _, _, _) => true,
         };
-        _client = new HttpClient(digestHandler) { BaseAddress = new Uri(_baseUrl), Timeout = TimeSpan.FromSeconds(10) };
+        _client = new HttpClient(digestHandler)
+        {
+            BaseAddress = new Uri(_baseUrl),
+            Timeout = TimeSpan.FromSeconds(10),
+        };
         return _client;
     }
 
@@ -173,6 +195,59 @@ public class ISAPIClient : IDisposable
         catch { }
 
         return names;
+    }
+
+    /// <summary>
+    /// Discover the HTTP port by probing common ports for ISAPI.
+    /// </summary>
+    public static async Task<int?> DiscoverHttpPortAsync(string ip, int timeoutMs = 3000)
+    {
+        int[] ports = [80, 81, 82, 83, 84, 85, 443, 8080, 8443, 8000, 8888];
+
+        foreach (var port in ports)
+        {
+            try
+            {
+                var scheme = port == 443 || port == 8443 ? "https" : "http";
+                using var handler = new HttpClientHandler
+                {
+                    ServerCertificateCustomValidationCallback = (_, _, _, _) => true,
+                };
+                using var client = new HttpClient(handler) { Timeout = TimeSpan.FromMilliseconds(timeoutMs) };
+                var resp = await client.GetAsync($"{scheme}://{ip}:{port}/ISAPI/System/deviceInfo");
+                if (resp.StatusCode == HttpStatusCode.OK || resp.StatusCode == HttpStatusCode.Unauthorized)
+                {
+                    Log.Info($"HTTP port discovered: {ip}:{port} ({scheme})");
+                    return port;
+                }
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Probe SDK ports (8000-8005, 8200) and return the first open one.
+    /// </summary>
+    public static async Task<int?> DiscoverSdkPortAsync(string ip, int timeoutMs = 2000)
+    {
+        int[] ports = [8000, 8001, 8002, 8003, 8004, 8005, 8200];
+
+        var tasks = ports.Select(async port =>
+        {
+            try
+            {
+                using var client = new System.Net.Sockets.TcpClient();
+                var connectTask = client.ConnectAsync(ip, port);
+                if (await Task.WhenAny(connectTask, Task.Delay(timeoutMs)) == connectTask && client.Connected)
+                    return port;
+            }
+            catch { }
+            return (int?)null;
+        });
+
+        var results = await Task.WhenAll(tasks);
+        return results.FirstOrDefault(p => p.HasValue);
     }
 
     /// <summary>
