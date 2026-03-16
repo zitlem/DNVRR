@@ -1,11 +1,7 @@
-name: Build & Release
+name: Build Installer
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -19,18 +15,7 @@ jobs:
         with:
           dotnet-version: '9.0.x'
 
-      - name: Restore
-        run: dotnet restore DNVRR
-
-      - name: Build
-        run: dotnet build DNVRR -c Release --no-restore
-
-      # Portable exe
-      - name: Publish Portable
-        run: dotnet publish DNVRR -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
-
-      # MSIX installer
-      - name: Publish for Installer
+      - name: Publish
         run: dotnet publish DNVRR -c Release -r win-x64 --self-contained true -o publish-installer
 
       - name: Create Installer
@@ -38,7 +23,6 @@ jobs:
         run: |
           $version = (Select-Xml -Path DNVRR/DNVRR.csproj -XPath "//Version").Node.InnerText
 
-          # Create Inno Setup script
           @"
           [Setup]
           AppName=DNVRR
@@ -67,28 +51,12 @@ jobs:
           Filename: "{app}\DNVRR.exe"; Description: "Launch DNVRR"; Flags: nowait postinstall skipifsilent
           "@ | Out-File -Encoding UTF8 setup.iss
 
-          # Download and run Inno Setup
           Invoke-WebRequest -Uri "https://jrsoftware.org/download.php/is.exe" -OutFile is-setup.exe
           Start-Process -Wait -FilePath is-setup.exe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /DIR=C:\InnoSetup"
           & "C:\InnoSetup\ISCC.exe" setup.iss
 
-      - name: Upload Portable
-        uses: actions/upload-artifact@v4
-        with:
-          name: DNVRR-Portable
-          path: DNVRR/bin/Release/net9.0-windows/win-x64/publish/DNVRR.exe
-
-      - name: Upload Installer
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: DNVRR-Installer
           path: installer-output/*.exe
-
-      - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            DNVRR/bin/Release/net9.0-windows/win-x64/publish/DNVRR.exe
-            installer-output/*.exe
-          generate_release_notes: true
