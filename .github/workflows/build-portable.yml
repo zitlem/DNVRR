@@ -2,6 +2,14 @@ name: Build Portable
 
 on:
   workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create a GitHub Release?'
+        type: boolean
+        default: true
+      version:
+        description: 'Release version (e.g. v1.2.0)'
+        required: false
 
 jobs:
   build:
@@ -15,11 +23,30 @@ jobs:
         with:
           dotnet-version: '9.0.x'
 
+      - name: Get version
+        id: version
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.version }}"
+          if (-not $v) {
+            $v = "v" + (Select-Xml -Path DNVRR/DNVRR.csproj -XPath "//Version").Node.InnerText
+          }
+          echo "tag=$v" >> $env:GITHUB_OUTPUT
+
       - name: Publish
         run: dotnet publish DNVRR -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
 
-      - name: Upload
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: DNVRR-Portable
           path: DNVRR/bin/Release/net9.0-windows/win-x64/publish/DNVRR.exe
+
+      - name: Create Release
+        if: inputs.create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: DNVRR ${{ steps.version.outputs.tag }} (Portable)
+          files: DNVRR/bin/Release/net9.0-windows/win-x64/publish/DNVRR.exe
+          generate_release_notes: true
