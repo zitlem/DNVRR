@@ -117,11 +117,14 @@ public class SdkManager : IDisposable
                         if (playerPort >= 0)
                         {
                             bool gpuOk = HCNetSDK.PlayM4_SetDecodeType(playerPort, HCNetSDK.DECODE_HIKVISION_GPU);
-                            Log.Info($"Preview started: {camera.Name}, ch={ch}, handle={handle}, GPU={gpuOk}");
+                            if (gpuOk)
+                                Log.Info($"Preview started: {camera.Name}, ch={ch}, handle={handle}, GPU=true");
+                            else
+                                Log.Warn($"Preview started: {camera.Name}, ch={ch}, handle={handle}, GPU failed, error={HCNetSDK.PlayM4_GetLastError(playerPort)}");
                         }
                         else
                         {
-                            Log.Info($"Preview started: {camera.Name}, ch={ch}, handle={handle}");
+                            Log.Warn($"Preview started: {camera.Name}, ch={ch}, handle={handle}, playerPort={playerPort} (GPU skipped)");
                         }
                     }
                     catch (Exception ex)
