@@ -147,6 +147,7 @@ public static class HCNetSDK
     [DllImport(DllName)]
     public static extern bool NET_DVR_StopRealPlay(int lRealHandle);
 
+
     // --- PTZ Control ---
 
     [DllImport(DllName)]
@@ -189,6 +190,27 @@ public static class HCNetSDK
 
     [DllImport(PlayDll)]
     public static extern uint PlayM4_GetLastError(int nPort);
+
+    [DllImport(PlayDll)]
+    public static extern bool PlayM4_GetPort(ref int nPort);
+
+    [DllImport(PlayDll)]
+    public static extern bool PlayM4_Play(int nPort, IntPtr hWnd);
+
+    [DllImport(PlayDll)]
+    public static extern bool PlayM4_Stop(int nPort);
+
+    [DllImport(PlayDll)]
+    public static extern bool PlayM4_InputData(int nPort, IntPtr pBuf, uint dwSize);
+
+    [DllImport(PlayDll)]
+    public static extern bool PlayM4_CloseStream(int nPort);
+
+    [DllImport(PlayDll)]
+    public static extern bool PlayM4_FreePort(int nPort);
+
+    [DllImport(PlayDll)]
+    public static extern bool PlayM4_RenderPrivateData(int nPort, int nInDisplay);
 
     // --- SDK Path (for loading dependent DLLs) ---
 

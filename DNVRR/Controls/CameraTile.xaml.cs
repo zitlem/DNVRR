@@ -86,6 +86,12 @@ public partial class CameraTile : UserControl
     /// </summary>
     public event EventHandler? FullscreenRequested;
 
+    /// <summary>
+    /// Event raised when user clicks on the native video panel.
+    /// </summary>
+    public event EventHandler? NativeMouseDown;
+    public event EventHandler? NativeRightClick;
+
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         if (_videoPanel == null)
@@ -93,6 +99,10 @@ public partial class CameraTile : UserControl
             _videoPanel = new VideoPanel();
             _videoPanel.NativeDoubleClick += (_, _) =>
                 Dispatcher.Invoke(() => FullscreenRequested?.Invoke(this, EventArgs.Empty));
+            _videoPanel.NativeMouseDown += (_, _) =>
+                Dispatcher.Invoke(() => NativeMouseDown?.Invoke(this, EventArgs.Empty));
+            _videoPanel.NativeRightClick += (_, _) =>
+                Dispatcher.Invoke(() => NativeRightClick?.Invoke(this, EventArgs.Empty));
             VideoBorder.Child = _videoPanel;
         }
     }

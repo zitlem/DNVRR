@@ -11,6 +11,7 @@
     <AssemblyName>DNVRR</AssemblyName>
     <RootNamespace>DNVRR</RootNamespace>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>

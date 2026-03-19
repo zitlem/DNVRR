@@ -70,11 +70,27 @@ public partial class App : Application
             Log.Error("No SDK available — video preview will not work");
         }
 
-        // Unhandled exceptions
+        // Unhandled exceptions — log full stack traces to crash log
+        var crashLogPath = Path.Combine(appDir, "data", "crash.log");
         DispatcherUnhandledException += (_, ex) =>
         {
             Log.Error("Unhandled exception", ex.Exception);
+            WriteCrashLog(crashLogPath, "DispatcherUnhandledException", ex.Exception);
             ex.Handled = true;
+        };
+        AppDomain.CurrentDomain.UnhandledException += (_, ex) =>
+        {
+            if (ex.ExceptionObject is Exception e)
+            {
+                Log.Error("AppDomain unhandled exception", e);
+                WriteCrashLog(crashLogPath, "AppDomain.UnhandledException", e);
+            }
+        };
+        TaskScheduler.UnobservedTaskException += (_, ex) =>
+        {
+            Log.Error("Unobserved task exception", ex.Exception);
+            WriteCrashLog(crashLogPath, "UnobservedTaskException", ex.Exception);
+            ex.SetObserved();
         };
 
         ShutdownMode = ShutdownMode.OnLastWindowClose;
@@ -132,5 +148,19 @@ public partial class App : Application
         _sdk?.Dispose();
         _db?.Dispose();
         base.OnExit(e);
+    }
+
+    private static void WriteCrashLog(string path, string source, Exception ex)
+    {
+        try
+        {
+            var entry = $"""
+                === {source} @ {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} ===
+                {ex}
+
+                """;
+            File.AppendAllText(path, entry);
+        }
+        catch { }
     }
 }

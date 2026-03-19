@@ -19,6 +19,8 @@ public class VideoPanel : HwndHost
 
     public event EventHandler? NativeDoubleClick;
     public event EventHandler? NativeMouseDown;
+    public event EventHandler? NativeMouseUp;
+    public event EventHandler? NativeRightClick;
 
     protected override HandleRef BuildWindowCore(HandleRef hwndParent)
     {
@@ -43,6 +45,8 @@ public class VideoPanel : HwndHost
     {
         const int WM_LBUTTONDBLCLK = 0x0203;
         const int WM_LBUTTONDOWN = 0x0201;
+        const int WM_LBUTTONUP = 0x0202;
+        const int WM_PARENTNOTIFY = 0x0210;
 
         if (msg == WM_LBUTTONDBLCLK)
         {
@@ -54,6 +58,34 @@ public class VideoPanel : HwndHost
         if (msg == WM_LBUTTONDOWN)
         {
             NativeMouseDown?.Invoke(this, EventArgs.Empty);
+        }
+
+        if (msg == WM_LBUTTONUP)
+        {
+            NativeMouseUp?.Invoke(this, EventArgs.Empty);
+        }
+
+        const int WM_RBUTTONDOWN = 0x0204;
+        if (msg == WM_RBUTTONDOWN)
+        {
+            NativeRightClick?.Invoke(this, EventArgs.Empty);
+        }
+
+        // PlayCtrl creates a child window for rendering that intercepts clicks.
+        // WM_PARENTNOTIFY is sent to us when the child receives mouse events.
+        if (msg == WM_PARENTNOTIFY)
+        {
+            int childMsg = (int)wParam & 0xFFFF;
+            if (childMsg == WM_LBUTTONDOWN)
+                NativeMouseDown?.Invoke(this, EventArgs.Empty);
+            else if (childMsg == WM_RBUTTONDOWN)
+                NativeRightClick?.Invoke(this, EventArgs.Empty);
+            else if (childMsg == WM_LBUTTONDBLCLK)
+            {
+                NativeDoubleClick?.Invoke(this, EventArgs.Empty);
+                handled = true;
+                return IntPtr.Zero;
+            }
         }
 
         return base.WndProc(hwnd, msg, wParam, lParam, ref handled);

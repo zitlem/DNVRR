@@ -49,7 +49,7 @@ public class SdkManager : IDisposable
             if (_loginSessions.TryGetValue(key, out existing))
                 return existing;
 
-            return await Task.Run(() =>
+            int result = await Task.Run(() =>
             {
                 var deviceInfo = new HCNetSDK.NET_DVR_DEVICEINFO_V30();
                 int userId = HCNetSDK.NET_DVR_Login_V30(nvr.Ip, nvr.SdkPort, nvr.Username, nvr.Password, ref deviceInfo);
@@ -68,6 +68,8 @@ public class SdkManager : IDisposable
                 _startDChans[key] = startDChan;
                 return userId;
             });
+
+            return result;
         }
         finally
         {
@@ -109,29 +111,7 @@ public class SdkManager : IDisposable
                 {
                     _playHandles[camera.Id] = handle;
                     camera.SdkPlayHandle = handle;
-
-                    // Try to enable GPU hardware decoding
-                    try
-                    {
-                        int playerPort = HCNetSDK.NET_DVR_GetRealPlayerIndex(handle);
-                        if (playerPort >= 0)
-                        {
-                            bool gpuOk = HCNetSDK.PlayM4_SetDecodeType(playerPort, HCNetSDK.DECODE_HIKVISION_GPU);
-                            if (gpuOk)
-                                Log.Info($"Preview started: {camera.Name}, ch={ch}, handle={handle}, GPU=true");
-                            else
-                                Log.Warn($"Preview started: {camera.Name}, ch={ch}, handle={handle}, GPU failed, error={HCNetSDK.PlayM4_GetLastError(playerPort)}");
-                        }
-                        else
-                        {
-                            Log.Warn($"Preview started: {camera.Name}, ch={ch}, handle={handle}, playerPort={playerPort} (GPU skipped)");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Log.Warn($"Preview started: {camera.Name}, ch={ch}, handle={handle}, GPU not available: {ex.Message}");
-                    }
-
+                    Log.Info($"Preview started: {camera.Name}, ch={ch}, handle={handle}");
                     return handle;
                 }
                 var err = HCNetSDK.NET_DVR_GetLastError();

@@ -2,7 +2,8 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="DNVRR - Fullscreen" Background="Black"
-        WindowStyle="None" WindowState="Maximized"
+        WindowStyle="None" WindowState="Normal"
+        WindowStartupLocation="Manual"
         KeyDown="Window_KeyDown"
         Closing="Window_Closing">
     <Grid>

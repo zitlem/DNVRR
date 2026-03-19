@@ -26,6 +26,7 @@ public partial class MainWindow : Window
     private DispatcherTimer? _probeTimer;
 
     private int? _restoreViewId;
+    private bool _restoreMaximized;
 
     public MainWindow(SdkManager sdk, Database db, Models.SavedWindowState? restoreState = null)
     {
@@ -36,18 +37,13 @@ public partial class MainWindow : Window
         if (restoreState != null)
         {
             _restoreViewId = restoreState.ViewId;
-            if (restoreState.IsMaximized)
-            {
-                WindowState = WindowState.Maximized;
-            }
-            else
-            {
-                WindowState = WindowState.Normal;
-                Left = restoreState.X;
-                Top = restoreState.Y;
-                Width = restoreState.Width;
-                Height = restoreState.Height;
-            }
+            _restoreMaximized = restoreState.IsMaximized;
+            // Position in normal state so WPF places the window on the correct monitor
+            WindowState = WindowState.Normal;
+            Left = restoreState.X;
+            Top = restoreState.Y;
+            Width = restoreState.Width;
+            Height = restoreState.Height;
 
             if (!restoreState.LeftSidebarOpen)
             {
@@ -66,6 +62,13 @@ public partial class MainWindow : Window
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
+        // Maximize after window is shown so it maximizes on the correct monitor
+        if (_restoreMaximized)
+        {
+            WindowState = WindowState.Maximized;
+            _restoreMaximized = false;
+        }
+
         LoadSidebar();
 
         // Restore active view if specified
@@ -250,7 +253,6 @@ public partial class MainWindow : Window
                     Background = Brushes.Transparent,
                 };
                 item.PreviewMouseLeftButtonDown += CameraItem_Click;
-                item.PreviewMouseMove += CameraItem_MouseMove;
                 item.MouseEnter += (s, _) =>
                 {
                     if (s is Border b) b.Background = new SolidColorBrush(Color.FromArgb(10, 255, 255, 255));
@@ -313,12 +315,31 @@ public partial class MainWindow : Window
             _suppressViewSizeChanged = false;
         }
 
-        // Re-highlight views list items
-        if (ViewsList.ItemsSource is List<ViewInfo> views)
+        // Defer highlight until containers are generated
+        Dispatcher.BeginInvoke(ApplyViewHighlight, DispatcherPriority.Loaded);
+    }
+
+    private void ApplyViewHighlight()
+    {
+        for (int i = 0; i < ViewsList.Items.Count; i++)
         {
-            // Force re-render to pick up active state
-            ViewsList.ItemsSource = null;
-            ViewsList.ItemsSource = views;
+            var container = ViewsList.ItemContainerGenerator.ContainerFromIndex(i) as ContentPresenter;
+            if (container == null) continue;
+
+            var border = VisualTreeHelper.GetChildrenCount(container) > 0
+                ? VisualTreeHelper.GetChild(container, 0) as Border
+                : null;
+            if (border == null) continue;
+
+            var view = ViewsList.Items[i] as ViewInfo;
+            bool isActive = view != null && _activeView != null && view.Id == _activeView.Id;
+
+            border.BorderBrush = isActive
+                ? new SolidColorBrush((Color)ColorConverter.ConvertFromString("#3b82f6"))
+                : Brushes.Transparent;
+            border.Background = isActive
+                ? new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1e293b"))
+                : Brushes.Transparent;
         }
     }
 
@@ -429,74 +450,132 @@ public partial class MainWindow : Window
 
     // --- Camera Assignment (manual drag via mouse tracking) ---
 
-    private Point _dragStart;
     private int? _draggingCameraId;
     private bool _isDragging;
+    private DispatcherTimer? _dragTimer;
+    private int? _pendingDragCameraId;
+    private CameraTile? _pendingDragTile;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct POINT { public int X, Y; }
+
+    private POINT _dragStartScreen;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
 
     private void CameraItem_Click(object sender, MouseButtonEventArgs e)
     {
         if (_activeView == null) return;
         if (sender is not Border border || border.Tag is not CameraInfo cam) return;
-        _dragStart = e.GetPosition(null);
+        GetCursorPos(out _dragStartScreen);
         _pendingDragCameraId = cam.Id;
+        _pendingDragTile = null;
+        Log.Info($"Drag: sidebar mousedown cam={cam.Name} (id={cam.Id}), start=({_dragStartScreen.X},{_dragStartScreen.Y})");
+        StartDrag();
     }
 
-    private int? _pendingDragCameraId;
-
-    private void CameraItem_MouseMove(object sender, MouseEventArgs e)
+    private void StartDrag()
     {
-        if (e.LeftButton != MouseButtonState.Pressed || _pendingDragCameraId == null) return;
-        if (_activeView == null) return;
-        if (_isDragging) return;
-
-        var pos = e.GetPosition(null);
-        if (Math.Abs(pos.X - _dragStart.X) < SystemParameters.MinimumHorizontalDragDistance &&
-            Math.Abs(pos.Y - _dragStart.Y) < SystemParameters.MinimumVerticalDragDistance)
-            return;
-
-        _draggingCameraId = _pendingDragCameraId;
-        _pendingDragCameraId = null;
-        _isDragging = true;
-        Mouse.OverrideCursor = Cursors.Hand;
-        Mouse.Capture(this, CaptureMode.SubTree);
+        // Only start the timer — do NOT set _isDragging here.
+        // The timer will detect movement threshold and promote to active drag.
+        _dragTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(30) };
+        _dragTimer.Tick -= DragTimer_Tick;
+        _dragTimer.Tick += DragTimer_Tick;
+        _dragTimer.Start();
     }
 
-    private void Tile_MouseMove(object sender, MouseEventArgs e)
+    private void DragTimer_Tick(object? sender, EventArgs e)
     {
-        if (e.LeftButton != MouseButtonState.Pressed) return;
-        if (_activeView == null) return;
-        if (_isDragging) return;
-        if (sender is not CameraTile tile || tile.Camera == null) return;
+        bool leftDown = (GetAsyncKeyState(0x01) & 0x8000) != 0;
 
-        var pos = e.GetPosition(null);
-        if (Math.Abs(pos.X - _dragStart.X) < SystemParameters.MinimumHorizontalDragDistance &&
-            Math.Abs(pos.Y - _dragStart.Y) < SystemParameters.MinimumVerticalDragDistance)
+        if (!leftDown)
+        {
+            _dragTimer?.Stop();
+            if (_isDragging)
+            {
+                Log.Info($"Drag: mouse released while dragging camId={_draggingCameraId}");
+                CompleteDrop();
+            }
+            else
+            {
+                Log.Info($"Drag: mouse released without drag (click), pending={_pendingDragCameraId}, tile={_pendingDragTile?.Camera?.Name}");
+                _pendingDragCameraId = null;
+                _pendingDragTile = null;
+            }
             return;
+        }
 
-        _draggingCameraId = tile.Camera.Id;
-        _isDragging = true;
-        Mouse.OverrideCursor = Cursors.Hand;
-        Mouse.Capture(this, CaptureMode.SubTree);
+        // Check if we should start dragging (pending drag from tile or sidebar)
+        if (!_isDragging && (_pendingDragCameraId != null || _pendingDragTile != null))
+        {
+            GetCursorPos(out var cursorPos);
+            int dx = Math.Abs(cursorPos.X - _dragStartScreen.X);
+            int dy = Math.Abs(cursorPos.Y - _dragStartScreen.Y);
+            if (dx >= SystemParameters.MinimumHorizontalDragDistance ||
+                dy >= SystemParameters.MinimumVerticalDragDistance)
+            {
+                if (_pendingDragTile?.Camera != null)
+                {
+                    _draggingCameraId = _pendingDragTile.Camera.Id;
+                    Log.Info($"Drag: started from tile, cam={_pendingDragTile.Camera.Name}, dx={dx}, dy={dy}");
+                    _pendingDragTile = null;
+                }
+                else if (_pendingDragCameraId != null)
+                {
+                    _draggingCameraId = _pendingDragCameraId;
+                    Log.Info($"Drag: started from sidebar, camId={_pendingDragCameraId}, dx={dx}, dy={dy}");
+                    _pendingDragCameraId = null;
+                }
+                _isDragging = true;
+                Mouse.OverrideCursor = Cursors.Hand;
+            }
+        }
     }
 
     private void Window_MouseMove(object sender, MouseEventArgs e)
     {
-        if (!_isDragging) return;
-        // Cancel drag if mouse button released (safety)
-        if (e.LeftButton != MouseButtonState.Pressed)
-            CancelDrag();
+        // Drag is handled by timer
     }
 
-    private async void Window_MouseUp(object sender, MouseButtonEventArgs e)
+    private void Window_MouseUp(object sender, MouseButtonEventArgs e)
     {
-        if (!_isDragging)
-        {
-            _pendingDragCameraId = null;
-            return;
-        }
+        // Timer handles drop
+    }
 
+    /// <summary>
+    /// Convert screen coordinates to position relative to CameraGrid using Win32.
+    /// Mouse.GetPosition doesn't work over native HWNDs.
+    /// </summary>
+    private Point GetGridPositionFromScreen()
+    {
+        GetCursorPos(out var screenPt);
+        // Convert screen coords to window coords
+        var hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        ScreenToClient(hwnd, ref screenPt);
+
+        // Convert from physical pixels to WPF DIPs
+        var source = PresentationSource.FromVisual(this);
+        double dpiX = source?.CompositionTarget?.TransformFromDevice.M11 ?? 1.0;
+        double dpiY = source?.CompositionTarget?.TransformFromDevice.M22 ?? 1.0;
+        var windowPt = new Point(screenPt.X * dpiX, screenPt.Y * dpiY);
+
+        // Get CameraGrid position relative to window
+        var gridOffset = CameraGrid.TransformToAncestor(this).Transform(new Point(0, 0));
+        return new Point(windowPt.X - gridOffset.X, windowPt.Y - gridOffset.Y);
+    }
+
+    private async void CompleteDrop()
+    {
         if (_draggingCameraId == null || _activeView == null)
         {
+            Log.Info($"Drag: CompleteDrop cancelled — camId={_draggingCameraId}, view={_activeView?.Name}");
             CancelDrag();
             return;
         }
@@ -504,14 +583,19 @@ public partial class MainWindow : Window
         int camId = _draggingCameraId.Value;
         CancelDrag();
 
-        // Check if mouse is over the grid
-        var pos = e.GetPosition(CameraGrid);
+        var pos = GetGridPositionFromScreen();
+        Log.Info($"Drag: drop at grid pos=({pos.X:F0},{pos.Y:F0}), gridSize=({CameraGrid.ActualWidth:F0},{CameraGrid.ActualHeight:F0})");
+
         if (pos.X < 0 || pos.Y < 0 || pos.X > CameraGrid.ActualWidth || pos.Y > CameraGrid.ActualHeight)
+        {
+            Log.Info("Drag: drop outside grid, ignoring");
             return;
+        }
 
         int col = Math.Clamp((int)(pos.X / (CameraGrid.ActualWidth / _gridCols)), 0, _gridCols - 1);
         int row = Math.Clamp((int)(pos.Y / (CameraGrid.ActualHeight / _gridRows)), 0, _gridRows - 1);
         int targetSlot = row * _gridCols + col;
+        Log.Info($"Drag: target slot={targetSlot} (row={row}, col={col})");
 
         var grid = _activeView.GetGridArray();
         if (targetSlot >= grid.Length) return;
@@ -564,11 +648,12 @@ public partial class MainWindow : Window
 
     private void CancelDrag()
     {
+        _dragTimer?.Stop();
         _isDragging = false;
         _draggingCameraId = null;
         _pendingDragCameraId = null;
+        _pendingDragTile = null;
         Mouse.OverrideCursor = null;
-        Mouse.Capture(null);
     }
 
     private async void TileRightClick(object sender, MouseButtonEventArgs e)
@@ -649,9 +734,30 @@ public partial class MainWindow : Window
                         tile.Camera = cam;
                 }
 
-                tile.PreviewMouseLeftButtonDown += (s, ev) => { SelectTile(tile); _dragStart = ev.GetPosition(null); };
-                tile.PreviewMouseMove += Tile_MouseMove;
+                tile.PreviewMouseLeftButtonDown += (s, ev) =>
+                {
+                    SelectTile(tile);
+                    GetCursorPos(out _dragStartScreen);
+                    if (tile.Camera != null && _activeView != null)
+                    {
+                        _pendingDragTile = tile;
+                        Log.Info($"Drag: tile WPF mousedown cam={tile.Camera.Name}, start=({_dragStartScreen.X},{_dragStartScreen.Y})");
+                        StartDrag();
+                    }
+                };
+                tile.NativeMouseDown += (s, _) =>
+                {
+                    SelectTile(tile);
+                    GetCursorPos(out _dragStartScreen);
+                    if (tile.Camera != null && _activeView != null)
+                    {
+                        _pendingDragTile = tile;
+                        Log.Info($"Drag: tile NATIVE mousedown cam={tile.Camera.Name}, start=({_dragStartScreen.X},{_dragStartScreen.Y})");
+                        StartDrag();
+                    }
+                };
                 tile.MouseRightButtonDown += TileRightClick;
+                tile.NativeRightClick += (s, _) => TileRightClick(tile, null!);
                 tile.FullscreenRequested += Tile_FullscreenRequested;
 
                 Grid.SetRow(tile, row);
@@ -819,7 +925,12 @@ public partial class MainWindow : Window
         if (sender is CameraTile tile && tile.Camera != null)
         {
             var fsWindow = new FullscreenWindow(_sdk, tile.Camera);
+            // Position on the same monitor as this window using WPF coordinates
+            var isMax = WindowState == WindowState.Maximized;
+            fsWindow.Left = isMax ? RestoreBounds.Left : Left;
+            fsWindow.Top = isMax ? RestoreBounds.Top : Top;
             fsWindow.Show();
+            fsWindow.WindowState = WindowState.Maximized;
         }
     }
 
@@ -883,6 +994,11 @@ public partial class MainWindow : Window
         // X button closes all windows; "Close Window" button closes just this one
         if (!_closeSingleOnly)
         {
+            // Save all window states before closing — windows are removed from
+            // Application.Current.Windows as they close, so we must save first
+            if (Application.Current is App app)
+                app.SaveAllWindowStates();
+
             var others = new List<MainWindow>();
             foreach (Window w in Application.Current.Windows)
                 if (w is MainWindow mw && mw != this)
